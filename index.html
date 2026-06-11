@@ -39,6 +39,21 @@
       color:#fff; font-weight:600; font-size:16px; cursor:pointer; box-shadow:0 1px 2px rgba(0,0,0,0.1); }
     .connect button:disabled { opacity:.5; cursor:default; }
     .who { max-width:420px; margin:0 auto; width:100%; font-size:12px; color:var(--gray-400); text-align:center; }
+    /* Historique des scans */
+    .history-toggle { max-width:420px; margin:0 auto; width:100%; padding:12px; border:1px solid var(--gray-200);
+      border-radius:12px; background:#fff; color:var(--gray-700); font-weight:600; font-size:14px; cursor:pointer;
+      box-shadow:0 1px 2px rgba(0,0,0,0.04); }
+    .history { max-width:420px; margin:0 auto; width:100%; background:#fff; border:1px solid var(--gray-200);
+      border-radius:12px; overflow:hidden; box-shadow:0 1px 2px rgba(0,0,0,0.04); }
+    .history .empty { padding:16px; font-size:13px; color:var(--gray-400); text-align:center; }
+    .history-item { display:flex; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--gray-100,#f3f4f6); }
+    .history-item:last-child { border-bottom:none; }
+    .history-item .dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+    .dot-success { background:#059669; } .dot-warning { background:#d97706; } .dot-error { background:#dc2626; }
+    .history-item .info { flex:1; min-width:0; }
+    .history-item .info .n { font-size:14px; font-weight:600; color:var(--gray-900); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .history-item .info .d { font-size:11px; color:var(--gray-500); }
+    .history-item .t { font-size:11px; color:var(--gray-400); white-space:nowrap; }
     #result { position:fixed; inset:0; z-index:50; display:none; flex-direction:column; align-items:center;
       justify-content:center; padding:24px; text-align:center; cursor:pointer; color:#fff; }
     #result.show { display:flex; }
@@ -73,6 +88,8 @@
       <div class="dup">Déjà scannés<b id="cDup">0</b></div>
       <div class="ko">Refusés<b id="cKo">0</b></div>
     </div>
+    <button class="history-toggle" id="historyToggle" style="display:none">🕒 Historique des scans</button>
+    <div class="history" id="historyBox" style="display:none"></div>
     <div class="who" id="whoBox" style="display:none"></div>
   </main>
 
@@ -96,7 +113,9 @@
     // 3) Nom de l'onglet et colonnes (par défaut conformes au projet)
     var SHEET_NAME = 'Invités';
     var COL = { PRENOM: 1, NOM: 2, TOKEN: 4, PRESENCE: 6 }; // index 0-based (A=0, B=1, ...)
-    var SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
+    // Le scope userinfo.email permet d'afficher "Connecté : <email>" ;
+    // sans lui, l'endpoint userinfo ne renvoie rien.
+    var SCOPE = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/userinfo.email';
     /* ============================================================ */
 
     var SHEETS_BASE = 'https://sheets.googleapis.com/v4/spreadsheets/' + SPREADSHEET_ID;
@@ -164,11 +183,13 @@
 
     function showWhoAmI() {
       var box = document.getElementById('whoBox');
-      box.style.display = 'block';
       fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: 'Bearer ' + accessToken } })
         .then(function (r) { return r.json(); })
-        .then(function (u) { box.textContent = 'Connecté : ' + (u.email || u.name || ''); })
-        .catch(function () {});
+        .then(function (u) {
+          var qui = u.email || u.name || '';
+          if (qui) { box.textContent = 'Connecté : ' + qui; box.style.display = 'block'; }
+        })
+        .catch(function () { /* on n'affiche rien plutôt qu'un "Connecté :" vide */ });
     }
 
     /* ---------- Appels API Sheets (avec refresh auto du token) ---------- */
@@ -221,11 +242,22 @@
             }
             var ts = horodatageParis();
             var rowNumber = i + 2; // A2 = ligne 2
-            var writeRange = SHEET_NAME + '!G' + rowNumber;
-            return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(writeRange) + '?valueInputOption=RAW', {
-              method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: [[ts]] })
-            }).then(function () {
-              return { type: 'success', titre: 'Bienvenue !', prenom: prenom, nom: nom, horodatage: ts, message: 'Présence confirmée.' };
+            var cellRange = SHEET_NAME + '!G' + rowNumber;
+            // Garde anti-concurrence : on relit la cellule G juste avant
+            // d'écrire. Si un autre hôte a validé ce badge entre notre
+            // lecture initiale et maintenant, on bascule en "déjà scanné"
+            // au lieu d'écraser son horodatage.
+            return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(cellRange)).then(function (check) {
+              var current = ((check.values && check.values[0] && check.values[0][0]) || '').toString().trim();
+              if (current) {
+                return { type: 'warning', titre: 'Badge déjà scanné', prenom: prenom, nom: nom,
+                  horodatage: extraireHorodatage(current), message: 'Ce badge a déjà été enregistré.' };
+              }
+              return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(cellRange) + '?valueInputOption=RAW', {
+                method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: [[ts]] })
+              }).then(function () {
+                return { type: 'success', titre: 'Bienvenue !', prenom: prenom, nom: nom, horodatage: ts, message: 'Présence confirmée.' };
+              });
             });
           }
         }
@@ -267,10 +299,55 @@
         });
     }
 
+    /* ---------- Historique des scans (session en cours) ---------- */
+    var history = [];
+    var HISTORY_MAX = 50;
+    var LIBELLES = { success: 'Validé', warning: 'Déjà scanné', error: 'Refusé' };
+
+    function addToHistory(r) {
+      var nom = ((r.prenom || '') + ' ' + (r.nom || '')).trim() || 'Inconnu';
+      // Horodatage affiché : celui de la validation (ou du 1er scan en cas
+      // de doublon), sinon l'heure locale du scan refusé.
+      var quand = r.horodatage || horodatageParis();
+      history.unshift({ nom: nom, type: r.type, quand: quand, detail: LIBELLES[r.type] || '' });
+      if (history.length > HISTORY_MAX) history.pop();
+      renderHistory();
+    }
+
+    function renderHistory() {
+      var box = document.getElementById('historyBox');
+      if (history.length === 0) {
+        box.innerHTML = '<div class="empty">Aucun scan pour le moment.</div>';
+        return;
+      }
+      box.innerHTML = history.map(function (h) {
+        return '<div class="history-item">' +
+          '<span class="dot dot-' + h.type + '"></span>' +
+          '<span class="info"><span class="n">' + escapeHtml(h.nom) + '</span>' +
+          '<span class="d">' + h.detail + '</span></span>' +
+          '<span class="t">' + escapeHtml(h.quand) + '</span>' +
+          '</div>';
+      }).join('');
+    }
+
+    function escapeHtml(s) {
+      return (s || '').toString().replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    document.getElementById('historyToggle').addEventListener('click', function () {
+      var box = document.getElementById('historyBox');
+      var visible = box.style.display !== 'none';
+      box.style.display = visible ? 'none' : 'block';
+      this.textContent = visible ? '🕒 Historique des scans' : '🕒 Masquer l\'historique';
+      if (!visible) renderHistory();
+    });
+
     function showResult(r) {
       r = r || { type: 'error', titre: 'Erreur', message: '', prenom: '', nom: '', horodatage: '' };
       var emojis = { success: '✅', warning: '⚠️', error: '❌' };
       if (r.type === 'success') counts.ok++; else if (r.type === 'warning') counts.dup++; else counts.ko++;
+      addToHistory(r);
       document.getElementById('cOk').textContent = counts.ok;
       document.getElementById('cDup').textContent = counts.dup;
       document.getElementById('cKo').textContent = counts.ko;
@@ -305,6 +382,7 @@
       }
       document.getElementById('reader').style.display = 'block';
       document.getElementById('counterBox').style.display = 'flex';
+      document.getElementById('historyToggle').style.display = 'block';
       elStatus.textContent = 'Démarrage de la caméra…';
       html5Qr = new Html5Qrcode('reader', { verbose: false });
       html5Qr.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 240, height: 240 }, aspectRatio: 1.0 },
