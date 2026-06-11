@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Scan des badges (live)</title>
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <style>
+    :root {
+      --mc2i-blue:#01699e; --mc2i-pink:#dd025c;
+      --gray-50:#f9fafb; --gray-200:#e5e7eb; --gray-400:#9ca3af; --gray-500:#6b7280; --gray-700:#374151; --gray-900:#111827;
+    }
+    * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+    html, body { margin:0; padding:0; min-height:100%;
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+      background:var(--gray-50); color:var(--gray-900); }
+    body { display:flex; flex-direction:column; min-height:100vh; }
+    header { padding:14px 16px; text-align:center; background:#fff; border-bottom:1px solid var(--gray-200); }
+    .logo { display:inline-flex; align-items:baseline; font-weight:800; font-size:28px; letter-spacing:-0.05em; line-height:1; }
+    .logo .b { color:var(--mc2i-blue); } .logo .p { color:var(--mc2i-pink); }
+    .logo .store { margin-left:8px; font-size:11px; font-weight:600; color:var(--gray-500); text-transform:uppercase; letter-spacing:0.15em; align-self:center; }
+    header h1 { margin:8px 0 0; font-size:16px; font-weight:600; }
+    header p { margin:2px 0 0; font-size:12px; color:var(--gray-500); }
+    main { flex:1; display:flex; flex-direction:column; padding:16px; gap:14px; }
+    #reader { width:100%; max-width:420px; margin:0 auto; border-radius:16px; overflow:hidden; background:#000;
+      box-shadow:0 1px 3px rgba(0,0,0,0.08); border:1px solid var(--gray-200); }
+    #reader video { display:block; width:100% !important; }
+    .status { text-align:center; font-size:13px; color:var(--gray-500); min-height:18px; }
+    .counter { max-width:420px; margin:0 auto; width:100%; display:flex; gap:10px; }
+    .counter div { flex:1; background:#fff; border:1px solid var(--gray-200); border-radius:12px; padding:10px 6px;
+      text-align:center; font-size:12px; color:var(--gray-500); box-shadow:0 1px 2px rgba(0,0,0,0.04); }
+    .counter b { display:block; font-size:20px; margin-bottom:2px; }
+    .counter .ok b { color:#059669; } .counter .dup b { color:#d97706; } .counter .ko b { color:#dc2626; }
+    .connect { max-width:420px; margin:24px auto 0; width:100%; background:#fff; border:1px solid var(--gray-200);
+      border-radius:16px; padding:24px; text-align:center; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+    .connect p { font-size:13px; color:var(--gray-500); margin:0 0 16px; line-height:1.5; }
+    .connect button { width:100%; padding:14px; border:none; border-radius:12px; background:var(--mc2i-blue);
+      color:#fff; font-weight:600; font-size:16px; cursor:pointer; box-shadow:0 1px 2px rgba(0,0,0,0.1); }
+    .connect button:disabled { opacity:.5; cursor:default; }
+    .who { max-width:420px; margin:0 auto; width:100%; font-size:12px; color:var(--gray-400); text-align:center; }
+    #result { position:fixed; inset:0; z-index:50; display:none; flex-direction:column; align-items:center;
+      justify-content:center; padding:24px; text-align:center; cursor:pointer; color:#fff; }
+    #result.show { display:flex; }
+    #result .emoji { font-size:92px; line-height:1; margin-bottom:16px; }
+    #result h2 { margin:0 0 8px; font-size:30px; font-weight:700; }
+    #result .name { font-size:24px; font-weight:700; margin:4px 0 12px; }
+    #result .msg { font-size:18px; opacity:.95; }
+    #result .ts { margin-top:18px; font-size:15px; background:rgba(255,255,255,.2); padding:8px 14px; border-radius:10px; display:inline-block; }
+    #result .tap { margin-top:28px; font-size:13px; opacity:.85; }
+    .r-success { background:#059669; } .r-warning { background:#d97706; } .r-error { background:#dc2626; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo"><span class="b">mc</span><span class="p">2</span><span class="b">i</span><span class="store">Événement</span></div>
+    <h1>📷 Scan des badges (live)</h1>
+    <p>Caméra en continu</p>
+  </header>
+
+  <main>
+    <!-- Étape 1 : connexion -->
+    <div class="connect" id="connectBox">
+      <p>Connecte-toi avec ton compte Google <b>mc2i</b> pour autoriser l'accès à la liste des invités.</p>
+      <button id="signinBtn" disabled>Se connecter avec Google</button>
+    </div>
+
+    <!-- Étape 2 : scan -->
+    <div id="reader" style="display:none"></div>
+    <div class="status" id="status"></div>
+    <div class="counter" id="counterBox" style="display:none">
+      <div class="ok">Validés<b id="cOk">0</b></div>
+      <div class="dup">Déjà scannés<b id="cDup">0</b></div>
+      <div class="ko">Refusés<b id="cKo">0</b></div>
+    </div>
+    <div class="who" id="whoBox" style="display:none"></div>
+  </main>
+
+  <div id="result" onclick="closeResult()">
+    <div class="emoji" id="rEmoji"></div>
+    <h2 id="rTitre"></h2>
+    <div class="name" id="rName"></div>
+    <div class="msg" id="rMsg"></div>
+    <div class="ts" id="rTs" style="display:none"></div>
+    <div class="tap">Touchez l'écran pour scanner le suivant</div>
+  </div>
+
+  <script>
+    /* ============================================================
+       CONFIGURATION — à remplir une seule fois
+       ============================================================ */
+    // 1) ID client OAuth (type "Application Web") créé dans Google Cloud Console
+    var CLIENT_ID = '215614046812-kflutce5nk883kn65j4opue6g54su1c1.apps.googleusercontent.com';
+    // 2) ID du Google Sheet (dans l'URL : .../spreadsheets/d/ <CET_ID> /edit)
+    var SPREADSHEET_ID = '1oxZfPISL-aFa6ZLyFNVo9xWs7mUOLRKWC7DKcVteWVc';
+    // 3) Nom de l'onglet et colonnes (par défaut conformes au projet)
+    var SHEET_NAME = 'Invités';
+    var COL = { PRENOM: 1, NOM: 2, TOKEN: 4, PRESENCE: 6 }; // index 0-based (A=0, B=1, ...)
+    var SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
+    /* ============================================================ */
+
+    var SHEETS_BASE = 'https://sheets.googleapis.com/v4/spreadsheets/' + SPREADSHEET_ID;
+    var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+    var html5Qr = null, liveActive = false, busy = false, lastToken = '', lastTokenTime = 0;
+    var counts = { ok: 0, dup: 0, ko: 0 };
+    var elStatus = document.getElementById('status');
+    var elResult = document.getElementById('result');
+
+    /* ---------- Authentification Google (GIS) ---------- */
+    var accessToken = null, tokenClient = null, tokenWaiters = [];
+
+    function gisReady() { return window.google && google.accounts && google.accounts.oauth2; }
+
+    function initTokenClient() {
+      tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: CLIENT_ID,
+        scope: SCOPE,
+        callback: function (resp) {
+          var ws = tokenWaiters; tokenWaiters = [];
+          if (resp && resp.access_token) {
+            accessToken = resp.access_token;
+            ws.forEach(function (w) { w.resolve(accessToken); });
+          } else {
+            ws.forEach(function (w) { w.reject(new Error('auth')); });
+          }
+        }
+      });
+    }
+
+    function getToken(forcePrompt) {
+      return new Promise(function (resolve, reject) {
+        if (accessToken && !forcePrompt) { resolve(accessToken); return; }
+        if (!tokenClient) { reject(new Error('gis')); return; }
+        tokenWaiters.push({ resolve: resolve, reject: reject });
+        tokenClient.requestAccessToken({ prompt: forcePrompt ? 'consent' : '' });
+      });
+    }
+
+    // Attend que la lib GIS soit chargée pour activer le bouton
+    (function waitGis() {
+      if (gisReady()) {
+        if (CLIENT_ID.indexOf('METTRE_ICI') === 0) {
+          document.getElementById('signinBtn').textContent = '⚠️ CLIENT_ID non configuré';
+          return;
+        }
+        initTokenClient();
+        document.getElementById('signinBtn').disabled = false;
+      } else {
+        setTimeout(waitGis, 200);
+      }
+    })();
+
+    document.getElementById('signinBtn').addEventListener('click', function () {
+      try { audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+      getToken(true).then(function () {
+        document.getElementById('connectBox').style.display = 'none';
+        showWhoAmI();
+        startLive();
+      }).catch(function () {
+        elStatus.textContent = 'Connexion annulée. Réessaie.';
+      });
+    });
+
+    function showWhoAmI() {
+      var box = document.getElementById('whoBox');
+      box.style.display = 'block';
+      fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: 'Bearer ' + accessToken } })
+        .then(function (r) { return r.json(); })
+        .then(function (u) { box.textContent = 'Connecté : ' + (u.email || u.name || ''); })
+        .catch(function () {});
+    }
+
+    /* ---------- Appels API Sheets (avec refresh auto du token) ---------- */
+    function authedFetch(url, opts, retried) {
+      opts = opts || {};
+      opts.headers = opts.headers || {};
+      opts.headers['Authorization'] = 'Bearer ' + accessToken;
+      return fetch(url, opts).then(function (res) {
+        if (res.status === 401 && !retried) {
+          accessToken = null;
+          return getToken(false).then(function () { return authedFetch(url, opts, true); });
+        }
+        if (!res.ok) { return res.text().then(function () { throw new Error('API ' + res.status); }); }
+        return res.json();
+      });
+    }
+
+    function horodatageParis() {
+      var p = new Intl.DateTimeFormat('fr-FR', {
+        timeZone: 'Europe/Paris', year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+      }).formatToParts(new Date()).reduce(function (a, x) { a[x.type] = x.value; return a; }, {});
+      return p.day + '/' + p.month + '/' + p.year + ' ' + p.hour + ':' + p.minute + ':' + p.second;
+    }
+
+    function extraireHorodatage(v) {
+      var s = (v || '').toString();
+      var m = s.match(/\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}(:\d{2})?/);
+      return m ? m[0] : s;
+    }
+
+    /* ---------- Validation (équivalent client de validerToken) ---------- */
+    function validerToken(token) {
+      token = (token || '').toString().trim();
+      if (!UUID_RE.test(token)) {
+        return Promise.resolve({ type: 'error', titre: 'QR Code invalide', prenom: '', nom: '', horodatage: '', message: 'Format de badge incorrect.' });
+      }
+      var readRange = SHEET_NAME + '!A2:G';
+      return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(readRange)).then(function (data) {
+        var rows = data.values || [];
+        for (var i = 0; i < rows.length; i++) {
+          var row = rows[i];
+          if ((row[COL.TOKEN] || '').toString() === token) {
+            var prenom = (row[COL.PRENOM] || '').toString().trim();
+            var nom = (row[COL.NOM] || '').toString().trim();
+            var presence = (row[COL.PRESENCE] || '').toString().trim();
+            if (presence) {
+              return { type: 'warning', titre: 'Badge déjà scanné', prenom: prenom, nom: nom,
+                horodatage: extraireHorodatage(presence), message: 'Ce badge a déjà été enregistré.' };
+            }
+            var ts = horodatageParis();
+            var rowNumber = i + 2; // A2 = ligne 2
+            var writeRange = SHEET_NAME + '!G' + rowNumber;
+            return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(writeRange) + '?valueInputOption=RAW', {
+              method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: [[ts]] })
+            }).then(function () {
+              return { type: 'success', titre: 'Bienvenue !', prenom: prenom, nom: nom, horodatage: ts, message: 'Présence confirmée.' };
+            });
+          }
+        }
+        return { type: 'error', titre: 'Badge non reconnu', prenom: '', nom: '', horodatage: '', message: "Ce QR Code n'est pas dans la liste des invités." };
+      });
+    }
+
+    /* ---------- Son + vibration ---------- */
+    var audioCtx = null;
+    function beep(type) {
+      try {
+        audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+        var f = { success: 880, warning: 520, error: 200 };
+        var osc = audioCtx.createOscillator(), g = audioCtx.createGain();
+        osc.frequency.value = f[type] || 440; osc.type = 'sine';
+        osc.connect(g); g.connect(audioCtx.destination);
+        g.gain.setValueAtTime(0.25, audioCtx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.3);
+      } catch (e) {}
+    }
+    function vibrate(type) { if (navigator.vibrate) navigator.vibrate(type === 'error' ? [120, 60, 120] : 80); }
+
+    /* ---------- Scan ---------- */
+    function onDecoded(token) {
+      if (busy) return;
+      token = (token || '').toString().trim();
+      if (!token) return;
+      var now = Date.now();
+      if (token === lastToken && (now - lastTokenTime) < 4000) return;
+      lastToken = token; lastTokenTime = now;
+
+      busy = true; elStatus.textContent = 'Vérification…'; pauseLive();
+      validerToken(token)
+        .then(showResult)
+        .catch(function (err) {
+          showResult({ type: 'error', titre: 'Erreur', prenom: '', nom: '', horodatage: '',
+            message: 'Accès à la feuille impossible (' + (err && err.message ? err.message : 'erreur') + ').' });
+        });
+    }
+
+    function showResult(r) {
+      r = r || { type: 'error', titre: 'Erreur', message: '', prenom: '', nom: '', horodatage: '' };
+      var emojis = { success: '✅', warning: '⚠️', error: '❌' };
+      if (r.type === 'success') counts.ok++; else if (r.type === 'warning') counts.dup++; else counts.ko++;
+      document.getElementById('cOk').textContent = counts.ok;
+      document.getElementById('cDup').textContent = counts.dup;
+      document.getElementById('cKo').textContent = counts.ko;
+      document.getElementById('rEmoji').textContent = emojis[r.type] || '❌';
+      document.getElementById('rTitre').textContent = r.titre || '';
+      document.getElementById('rName').textContent = ((r.prenom || '') + ' ' + (r.nom || '')).trim();
+      document.getElementById('rMsg').textContent = r.message || '';
+      var tsEl = document.getElementById('rTs');
+      if (r.type === 'warning' && r.horodatage) { tsEl.textContent = '🕒 Premier scan : ' + r.horodatage; tsEl.style.display = 'inline-block'; }
+      else if (r.type === 'success' && r.horodatage) { tsEl.textContent = '🕒 ' + r.horodatage; tsEl.style.display = 'inline-block'; }
+      else { tsEl.style.display = 'none'; }
+      elResult.className = 'show r-' + r.type;
+      beep(r.type); vibrate(r.type);
+      clearTimeout(window._resumeTimer);
+      window._resumeTimer = setTimeout(closeResult, 3000);
+    }
+
+    function closeResult() {
+      clearTimeout(window._resumeTimer);
+      elResult.className = ''; busy = false;
+      elStatus.textContent = 'Visez un QR Code…';
+      resumeLive();
+    }
+
+    function pauseLive() { if (html5Qr && liveActive) { try { html5Qr.pause(true); } catch (e) {} } }
+    function resumeLive() { if (html5Qr && liveActive) { try { html5Qr.resume(); } catch (e) {} } }
+
+    function startLive() {
+      if (SPREADSHEET_ID.indexOf('METTRE_ICI') === 0) {
+        elStatus.textContent = '⚠️ SPREADSHEET_ID non configuré dans le fichier.';
+        return;
+      }
+      document.getElementById('reader').style.display = 'block';
+      document.getElementById('counterBox').style.display = 'flex';
+      elStatus.textContent = 'Démarrage de la caméra…';
+      html5Qr = new Html5Qrcode('reader', { verbose: false });
+      html5Qr.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 240, height: 240 }, aspectRatio: 1.0 },
+        function (txt) { onDecoded(txt); }, function () {}
+      ).then(function () { liveActive = true; elStatus.textContent = 'Visez un QR Code…'; })
+       .catch(function (err) {
+         liveActive = false;
+         elStatus.textContent = '❌ Caméra inaccessible (' + (err && err.name ? err.name : 'erreur') + '). Autorise la caméra.';
+       });
+    }
+  </script>
+</body>
+</html>
