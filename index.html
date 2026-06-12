@@ -73,7 +73,7 @@
   <header>
     <div class="logo"><span class="b">mc</span><span class="p">2</span><span class="b">i</span><span class="store">Événement</span></div>
     <h1>📷 Scan des badges (live)</h1>
-    <p>Caméra en continu · <b>v3</b></p>
+    <p>Caméra en continu · <b>v4</b></p>
   </header>
 
   <main>
@@ -125,6 +125,40 @@
     var SHEETS_BASE = 'https://sheets.googleapis.com/v4/spreadsheets/' + SPREADSHEET_ID;
     var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+    /* ---------- Debug ----------
+       Tous les logs partent dans la console (préfixe [SCAN]).
+       Sur mobile (pas de console) : ajouter ?debug=1 à l'URL pour afficher
+       un panneau de logs en bas de l'écran. */
+    var debugPanel = null;
+    function dbg() {
+      var args = Array.prototype.slice.call(arguments);
+      var line = '[' + new Date().toISOString().substr(11, 12) + '] ' + args.map(function (a) {
+        if (a instanceof Error) return a.name + ': ' + a.message;
+        if (a && typeof a === 'object') { try { return JSON.stringify(a); } catch (e) { return String(a); } }
+        return String(a);
+      }).join(' ');
+      try { console.log('[SCAN]', line); } catch (e) {}
+      if (debugPanel) {
+        debugPanel.textContent += line + '\n';
+        debugPanel.scrollTop = debugPanel.scrollHeight;
+      }
+    }
+    if (/[?&]debug=1/.test(location.search)) {
+      debugPanel = document.createElement('pre');
+      debugPanel.style.cssText = 'position:fixed;bottom:0;left:0;right:0;max-height:35vh;overflow:auto;' +
+        'background:rgba(0,0,0,.85);color:#4ade80;font-size:10px;padding:8px;margin:0;z-index:100;white-space:pre-wrap;';
+      document.body.appendChild(debugPanel);
+      dbg('Panneau de debug actif');
+    }
+    // Toute exception ou promesse rejetée non gérée devient visible.
+    window.addEventListener('error', function (e) {
+      dbg('❌ EXCEPTION NON GÉRÉE:', e.message, '@', (e.filename || '').split('/').pop() + ':' + (e.lineno || '?'));
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      dbg('❌ PROMESSE REJETÉE NON GÉRÉE:', e.reason);
+    });
+    dbg('Page chargée — version v4');
+
     var html5Qr = null, liveActive = false, busy = false, lastToken = '', lastTokenTime = 0;
     var counts = { ok: 0, dup: 0, ko: 0 };
     var elStatus = document.getElementById('status');
@@ -142,15 +176,18 @@
         callback: function (resp) {
           var ws = tokenWaiters; tokenWaiters = [];
           if (resp && resp.access_token) {
+            dbg('Auth OK, token reçu');
             accessToken = resp.access_token;
             ws.forEach(function (w) { w.resolve(accessToken); });
           } else {
+            dbg('Auth échouée:', resp && resp.error);
             ws.forEach(function (w) { w.reject(new Error('auth')); });
           }
         },
         // Sans ce handler, une popup bloquée par le navigateur mobile
         // laissait les promesses en attente pour toujours.
-        error_callback: function () {
+        error_callback: function (err) {
+          dbg('Auth error_callback:', err && err.type);
           var ws = tokenWaiters; tokenWaiters = [];
           ws.forEach(function (w) { w.reject(new Error('auth')); });
         }
@@ -168,9 +205,10 @@
         if (!forcePrompt) {
           setTimeout(function () {
             var idx = tokenWaiters.indexOf(w);
-            if (idx >= 0) { tokenWaiters.splice(idx, 1); reject(new Error('auth-timeout')); }
+            if (idx >= 0) { tokenWaiters.splice(idx, 1); dbg('Auth: timeout du refresh silencieux'); reject(new Error('auth-timeout')); }
           }, 10000);
         }
+        dbg('Auth: demande de token', forcePrompt ? '(avec consentement)' : '(silencieuse)');
         tokenClient.requestAccessToken({ prompt: forcePrompt ? 'consent' : '' });
       });
     }
@@ -223,13 +261,26 @@
         opts.signal = ctrl.signal;
         setTimeout(function () { ctrl.abort(); }, 8000);
       }
+      var t0 = Date.now();
+      var courte = url.replace(SHEETS_BASE, '…');
+      dbg('API →', (opts.method || 'GET'), courte);
       return fetch(url, opts).then(function (res) {
+        dbg('API ←', res.status, courte, (Date.now() - t0) + 'ms');
         if (res.status === 401 && !retried) {
+          dbg('Token expiré → rafraîchissement silencieux…');
           accessToken = null;
           return getToken(false).then(function () { return authedFetch(url, opts, true); });
         }
-        if (!res.ok) { return res.text().then(function () { throw new Error('API ' + res.status); }); }
+        if (!res.ok) {
+          return res.text().then(function (t) {
+            dbg('API erreur, corps:', (t || '').substr(0, 300));
+            throw new Error('API ' + res.status);
+          });
+        }
         return res.json();
+      }, function (err) {
+        dbg('API ✗', courte, (Date.now() - t0) + 'ms —', err);
+        throw err;
       });
     }
 
@@ -270,6 +321,7 @@
             };
           }
         }
+        dbg('Index chargé:', Object.keys(tokenIndex).length, 'token(s)');
         return tokenIndex;
       });
     }
@@ -281,7 +333,9 @@
         return Promise.resolve({ type: 'error', titre: 'QR Code invalide', prenom: '', nom: '', horodatage: '', message: 'Format de badge incorrect.' });
       }
       // Token connu → on évite la relecture complète de la feuille.
-      var lookup = (tokenIndex && tokenIndex[token])
+      var enCache = !!(tokenIndex && tokenIndex[token]);
+      dbg('Validation token', token.substr(0, 8) + '…', enCache ? '(en cache)' : '(absent du cache → rechargement index)');
+      var lookup = enCache
         ? Promise.resolve(tokenIndex[token])
         : chargerIndex().then(function (ix) { return ix[token]; });
 
@@ -333,6 +387,7 @@
       if (token === lastToken && (now - lastTokenTime) < 4000) return;
       lastToken = token; lastTokenTime = now;
 
+      dbg('QR décodé:', token.substr(0, 13) + '…');
       busy = true; elStatus.textContent = 'Vérification…'; pauseLive();
 
       // Sortie unique de la vérification : résultat, chien de garde (12 s)
@@ -348,9 +403,19 @@
         cancelBtn.style.display = 'none';
         cancelBtn.onclick = null;
         if (r) {
-          showResult(r);
+          dbg('Résultat:', r.type, '—', r.titre);
+          try {
+            showResult(r);
+          } catch (ex) {
+            // C'est une exception ici (ex. bug d'affichage) qui figeait
+            // l'écran : désormais on récupère et la caméra repart.
+            dbg('❌ EXCEPTION dans showResult:', ex);
+            busy = false; lastToken = '';
+            elStatus.textContent = '⚠️ Erreur d\'affichage — rescanne le badge.';
+            resumeLive();
+          }
         } else {
-          // Annulation manuelle : on rend la main sans compter le scan.
+          dbg('Vérification annulée manuellement');
           busy = false; lastToken = '';
           elStatus.textContent = 'Visez un QR Code…';
           resumeLive();
@@ -358,6 +423,7 @@
       }
 
       var watchdog = setTimeout(function () {
+        dbg('⏱ WATCHDOG 12 s déclenché');
         finish({ type: 'error', titre: 'Délai dépassé', prenom: '', nom: '', horodatage: '',
           message: 'Pas de réponse (réseau lent ?). Rescanne le badge.' });
       }, 12000);
@@ -367,6 +433,7 @@
       validerToken(token)
         .then(function (r) { finish(r); })
         .catch(function (err) {
+          dbg('validerToken rejeté:', err);
           var m = (err && err.name === 'AbortError') ? 'Réseau trop lent. Rescanne le badge.'
             : 'Accès à la feuille impossible (' + (err && err.message ? err.message : 'erreur') + ').';
           finish({ type: 'error', titre: 'Erreur', prenom: '', nom: '', horodatage: '', message: m });
@@ -374,7 +441,10 @@
     }
 
     /* ---------- Historique des scans (session en cours) ---------- */
-    var history = [];
+    // ⚠️ Ne JAMAIS nommer cette variable "history" : en portée globale elle
+    // entre en collision avec window.history (objet natif, non remplaçable),
+    // et history.unshift() lève alors une TypeError qui figeait tout l'écran.
+    var scanHistory = [];
     var HISTORY_MAX = 50;
     var LIBELLES = { success: 'Validé', warning: 'Déjà scanné', error: 'Refusé' };
 
@@ -383,18 +453,18 @@
       // Horodatage affiché : celui de la validation (ou du 1er scan en cas
       // de doublon), sinon l'heure locale du scan refusé.
       var quand = r.horodatage || horodatageParis();
-      history.unshift({ nom: nom, type: r.type, quand: quand, detail: LIBELLES[r.type] || '' });
-      if (history.length > HISTORY_MAX) history.pop();
+      scanHistory.unshift({ nom: nom, type: r.type, quand: quand, detail: LIBELLES[r.type] || '' });
+      if (scanHistory.length > HISTORY_MAX) scanHistory.pop();
       renderHistory();
     }
 
     function renderHistory() {
       var box = document.getElementById('historyBox');
-      if (history.length === 0) {
+      if (scanHistory.length === 0) {
         box.innerHTML = '<div class="empty">Aucun scan pour le moment.</div>';
         return;
       }
-      box.innerHTML = history.map(function (h) {
+      box.innerHTML = scanHistory.map(function (h) {
         return '<div class="history-item">' +
           '<span class="dot dot-' + h.type + '"></span>' +
           '<span class="info"><span class="n">' + escapeHtml(h.nom) + '</span>' +
@@ -469,9 +539,10 @@
       html5Qr = new Html5Qrcode('reader', { verbose: false });
       html5Qr.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 240, height: 240 }, aspectRatio: 1.0 },
         function (txt) { onDecoded(txt); }, function () {}
-      ).then(function () { liveActive = true; elStatus.textContent = 'Visez un QR Code…'; })
+      ).then(function () { liveActive = true; dbg('Caméra démarrée'); elStatus.textContent = 'Visez un QR Code…'; })
        .catch(function (err) {
          liveActive = false;
+         dbg('Caméra KO:', err);
          elStatus.textContent = '❌ Caméra inaccessible (' + (err && err.name ? err.name : 'erreur') + '). Autorise la caméra.';
        });
     }
