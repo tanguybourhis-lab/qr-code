@@ -4,7 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Scan des badges (live)</title>
-  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <!-- Librairie auto-hébergée (même repo) : aucune dépendance à un CDN
+       tiers le jour J. Fichier : html5-qrcode.min.js v2.3.8 (Apache-2.0). -->
+  <script src="html5-qrcode.min.js"></script>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
   <style>
     :root {
@@ -94,7 +96,7 @@
   <header>
     <div class="logo"><span class="b">mc</span><span class="p">2</span><span class="b">i</span><span class="store">Événement</span></div>
     <h1>📷 Scan des badges (live)</h1>
-    <p>Caméra en continu · <b>v6</b></p>
+    <p>Caméra en continu · <b>v7</b></p>
   </header>
 
   <main>
@@ -108,6 +110,7 @@
     <div id="reader" style="display:none"></div>
     <div class="status" id="status"></div>
     <button class="cancel" id="cancelBtn" style="display:none">✕ Annuler la vérification</button>
+    <button class="cancel" id="reauthBtn" style="display:none;color:var(--mc2i-blue)">🔐 Se reconnecter</button>
     <div class="counter" id="counterBox" style="display:none">
       <div class="tot">Inscrits<b id="cTot">–</b></div>
       <div class="ok">Validés<b id="cOk">–</b></div>
@@ -157,6 +160,9 @@
     var SCOPE = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/userinfo.email';
     /* ============================================================ */
 
+    // Lettres de colonnes dérivées de COL (pour construire les plages A1)
+    var TOKEN_LETTER = String.fromCharCode(65 + COL.TOKEN);       // 'E'
+    var PRESENCE_LETTER = String.fromCharCode(65 + COL.PRESENCE); // 'G'
     var SHEETS_BASE = 'https://sheets.googleapis.com/v4/spreadsheets/' + SPREADSHEET_ID;
     var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -192,7 +198,7 @@
     window.addEventListener('unhandledrejection', function (e) {
       dbg('❌ PROMESSE REJETÉE NON GÉRÉE:', e.reason);
     });
-    dbg('Page chargée — version v6');
+    dbg('Page chargée — version v7');
 
     var html5Qr = null, liveActive = false, busy = false, lastToken = '', lastTokenTime = 0;
     var elStatus = document.getElementById('status');
@@ -304,7 +310,25 @@
         if (res.status === 401 && !retried) {
           dbg('Token expiré → rafraîchissement silencieux…');
           accessToken = null;
-          return getToken(false).then(function () { return authedFetch(url, opts, true); });
+          return getToken(false).then(
+            function () { return authedFetch(url, opts, true); },
+            function (e) {
+              // Refresh silencieux impossible (cas fréquent sur mobile :
+              // popup bloquée hors geste utilisateur). On affiche le bouton
+              // de reconnexion — un tap (= geste) suffira à rouvrir la popup.
+              montrerReconnexion();
+              throw e;
+            }
+          );
+        }
+        // Quota dépassé (429) ou erreur serveur transitoire (5xx) : une
+        // relance unique après 1,2 s suffit en général. Uniquement pour les
+        // GET (idempotents) — un PUT/POST échoué est signalé à l'hôte qui
+        // rescanne, plutôt que de risquer un doublon.
+        if ((res.status === 429 || res.status >= 500) && !retried && (!opts.method || opts.method === 'GET')) {
+          dbg('API', res.status, '→ relance dans 1,2 s');
+          return new Promise(function (r) { setTimeout(r, 1200); })
+            .then(function () { return authedFetch(url, opts, true); });
         }
         if (!res.ok) {
           return res.text().then(function (t) {
@@ -318,6 +342,35 @@
         throw err;
       });
     }
+
+    /* ---------- Reconnexion en cours d'événement ----------
+       Le jeton OAuth expire après ~1 h. Quand le refresh silencieux échoue,
+       ce bouton apparaît : le tap fournit le geste utilisateur qui autorise
+       la popup Google (session déjà active → elle se referme aussitôt). */
+    function montrerReconnexion() {
+      document.getElementById('reauthBtn').style.display = 'block';
+      elStatus.textContent = '🔐 Session expirée — touche « Se reconnecter ».';
+    }
+
+    document.getElementById('reauthBtn').addEventListener('click', function () {
+      var btn = this;
+      btn.disabled = true;
+      new Promise(function (resolve, reject) {
+        if (!tokenClient) { reject(new Error('gis')); return; }
+        tokenWaiters.push({ resolve: resolve, reject: reject });
+        tokenClient.requestAccessToken({ prompt: '' }); // geste utilisateur → popup autorisée
+      }).then(function () {
+        dbg('Reconnexion réussie');
+        btn.disabled = false;
+        btn.style.display = 'none';
+        elStatus.textContent = liveActive ? 'Visez un QR Code…' : '';
+        rafraichirCompteurs(true);
+      }).catch(function (e) {
+        dbg('Reconnexion échouée:', e);
+        btn.disabled = false;
+        elStatus.textContent = '🔐 Reconnexion échouée — réessaie.';
+      });
+    });
 
     function horodatageParis() {
       var p = new Intl.DateTimeFormat('fr-FR', {
@@ -340,6 +393,7 @@
     // Les tokens ne changent jamais de ligne ; si un token est introuvable
     // (invité ajouté après le démarrage), on recharge l'index une fois.
     var tokenIndex = null;
+    var lastIndexLoad = 0; // horodatage du dernier chargement complet
 
     function chargerIndex() {
       var readRange = SHEET_NAME + '!A2:G';
@@ -347,6 +401,7 @@
         var rows = data.values || [];
         tokenIndex = {};
         invitesList = [];
+        lastIndexLoad = Date.now();
         for (var i = 0; i < rows.length; i++) {
           var entry = {
             row: i + 2, // A2 = ligne 2
@@ -366,32 +421,58 @@
     }
 
     /* ---------- Validation (équivalent client de validerToken) ---------- */
-    function validerToken(token) {
+    function validerToken(token, dejaRetente) {
       token = (token || '').toString().trim();
       if (!UUID_RE.test(token)) {
         return Promise.resolve({ type: 'error', titre: 'QR Code invalide', prenom: '', nom: '', horodatage: '', message: 'Format de badge incorrect.' });
       }
       // Token connu → on évite la relecture complète de la feuille.
+      // Token inconnu → on recharge l'index, mais au plus une fois toutes
+      // les 15 s (un badge étranger scanné en boucle ne doit pas marteler
+      // l'API avec des relectures complètes).
       var enCache = !!(tokenIndex && tokenIndex[token]);
-      dbg('Validation token', token.substr(0, 8) + '…', enCache ? '(en cache)' : '(absent du cache → rechargement index)');
-      var lookup = enCache
-        ? Promise.resolve(tokenIndex[token])
-        : chargerIndex().then(function (ix) { return ix[token]; });
+      dbg('Validation token', token.substr(0, 8) + '…', enCache ? '(en cache)' : '(absent du cache)');
+      var lookup;
+      if (enCache) {
+        lookup = Promise.resolve(tokenIndex[token]);
+      } else if (tokenIndex && (Date.now() - lastIndexLoad) < 15000) {
+        lookup = Promise.resolve(undefined); // index frais : inutile de recharger
+      } else {
+        lookup = chargerIndex().then(function (ix) { return ix[token]; });
+      }
 
       return lookup.then(function (entry) {
         if (!entry) {
           return { type: 'error', titre: 'Badge non reconnu', prenom: '', nom: '', horodatage: '', message: "Ce QR Code n'est pas dans la liste des invités." };
         }
-        var cellRange = SHEET_NAME + '!G' + entry.row;
-        // Lecture "fraîche" de la cellule G : sert à la fois de détection
-        // "déjà scanné" et de garde anti-concurrence entre plusieurs hôtes.
-        return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(cellRange)).then(function (check) {
-          var current = ((check.values && check.values[0] && check.values[0][0]) || '').toString().trim();
+        // Lecture "fraîche" de la ligne, du token (E) à la présence (G).
+        // Elle sert à trois choses :
+        //  1. détection "déjà scanné" ;
+        //  2. garde anti-concurrence entre plusieurs hôtes ;
+        //  3. ÉCRITURE VÉRIFIÉE : si le token lu sur la ligne n'est plus le
+        //     bon (feuille triée / ligne insérée pendant l'événement),
+        //     l'index est périmé → on le recharge et on retente, au lieu
+        //     d'écrire la présence sur la MAUVAISE personne.
+        var guardRange = SHEET_NAME + '!' + TOKEN_LETTER + entry.row + ':' + PRESENCE_LETTER + entry.row;
+        return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(guardRange)).then(function (check) {
+          var vals = (check.values && check.values[0]) || [];
+          var tokenSurLigne = (vals[0] || '').toString().trim();
+          if (tokenSurLigne !== token) {
+            dbg('⚠️ Index périmé (ligne ' + entry.row + ' : token différent) → rechargement');
+            if (dejaRetente) {
+              return { type: 'error', titre: 'Liste modifiée', prenom: '', nom: '', horodatage: '',
+                message: 'La feuille a été réorganisée pendant l\'événement. Réessaie le scan.' };
+            }
+            tokenIndex = null;
+            return chargerIndex().then(function () { return validerToken(token, true); });
+          }
+          var current = (vals[COL.PRESENCE - COL.TOKEN] || '').toString().trim();
           if (current) {
             return { type: 'warning', titre: 'Badge déjà scanné', prenom: entry.prenom, nom: entry.nom,
               horodatage: extraireHorodatage(current), message: 'Ce badge a déjà été enregistré.' };
           }
           var ts = horodatageParis();
+          var cellRange = SHEET_NAME + '!' + PRESENCE_LETTER + entry.row;
           return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(cellRange) + '?valueInputOption=RAW', {
             method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: [[ts]] })
           }).then(function () {
@@ -409,8 +490,6 @@
          feuille Invités → chaque device les journalise dans l'onglet
          "Scans" (créé automatiquement), qui sert aussi d'audit global. */
     var STATS_SHEET = 'Scans';
-    var TOKEN_LETTER = String.fromCharCode(65 + COL.TOKEN);       // 'E'
-    var PRESENCE_LETTER = String.fromCharCode(65 + COL.PRESENCE); // 'G'
     var hostEmail = '';
     var statsTimer = null;
 
@@ -439,8 +518,14 @@
     }
 
     // Recharge les 4 compteurs depuis le Sheet (1 seul appel batchGet).
-    function rafraichirCompteurs() {
+    // Throttle 10 s : à fort débit de scan (plusieurs hôtes), rafraîchir
+    // après CHAQUE scan consommerait inutilement le quota API partagé.
+    var lastStatsRefresh = 0;
+    function rafraichirCompteurs(force) {
       if (busy) return; // jamais en concurrence avec une vérification
+      var now = Date.now();
+      if (!force && (now - lastStatsRefresh) < 10000) return;
+      lastStatsRefresh = now;
       var url = SHEETS_BASE + '/values:batchGet' +
         '?ranges=' + encodeURIComponent(SHEET_NAME + '!' + TOKEN_LETTER + '2:' + TOKEN_LETTER) +
         '&ranges=' + encodeURIComponent(SHEET_NAME + '!' + PRESENCE_LETTER + '2:' + PRESENCE_LETTER) +
@@ -480,12 +565,19 @@
     function vibrate(type) { if (navigator.vibrate) navigator.vibrate(type === 'error' ? [120, 60, 120] : 80); }
 
     /* ---------- Scan ---------- */
-    function onDecoded(token) {
-      if (busy) return;
+    // `manuel` = true quand la validation vient du module "sans QR Code" :
+    // geste délibéré de l'hôte → on saute la fenêtre anti-double-scan et on
+    // donne un feedback si une vérification est déjà en cours (au lieu
+    // d'ignorer silencieusement le tap).
+    function onDecoded(token, manuel) {
+      if (busy) {
+        if (manuel) elStatus.textContent = 'Une vérification est déjà en cours…';
+        return;
+      }
       token = (token || '').toString().trim();
       if (!token) return;
       var now = Date.now();
-      if (token === lastToken && (now - lastTokenTime) < 4000) return;
+      if (!manuel && token === lastToken && (now - lastTokenTime) < 4000) return;
       lastToken = token; lastTokenTime = now;
 
       dbg('QR décodé:', token.substr(0, 13) + '…');
@@ -525,11 +617,15 @@
         }
       }
 
+      // 20 s : couvre la pire chaîne légitime (requête 8 s max + refresh
+      // d'auth 10 s, ou relance après 429). En sonnant trop tôt, on
+      // afficherait "Délai dépassé" alors que l'écriture aboutit ensuite.
+      // Pour les impatients, le bouton "Annuler" reste disponible.
       var watchdog = setTimeout(function () {
-        dbg('⏱ WATCHDOG 12 s déclenché');
+        dbg('⏱ WATCHDOG 20 s déclenché');
         finish({ type: 'error', titre: 'Délai dépassé', prenom: '', nom: '', horodatage: '',
           message: 'Pas de réponse (réseau lent ?). Rescanne le badge.' });
-      }, 12000);
+      }, 20000);
 
       cancelBtn.onclick = function () { finish(null); };
 
@@ -683,11 +779,12 @@
       resBox.innerHTML = html;
       Array.prototype.forEach.call(resBox.querySelectorAll('button.validate'), function (btn) {
         btn.addEventListener('click', function () {
+          if (busy) { elStatus.textContent = 'Une vérification est déjà en cours…'; return; }
           var tk = this.getAttribute('data-token');
           dbg('Validation manuelle pour', tk.substr(0, 8) + '…');
           fermerManuel();
           // Même circuit que le scan d'un QR Code (contrôles + journal).
-          onDecoded(tk);
+          onDecoded(tk, true);
         });
       });
     }
