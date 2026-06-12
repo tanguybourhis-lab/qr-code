@@ -39,6 +39,9 @@
       color:#fff; font-weight:600; font-size:16px; cursor:pointer; box-shadow:0 1px 2px rgba(0,0,0,0.1); }
     .connect button:disabled { opacity:.5; cursor:default; }
     .who { max-width:420px; margin:0 auto; width:100%; font-size:12px; color:var(--gray-400); text-align:center; }
+    .cancel { max-width:420px; margin:0 auto; width:100%; padding:10px; border:1px solid var(--gray-200);
+      border-radius:10px; background:#fff; color:#dc2626; font-weight:600; font-size:13px; cursor:pointer;
+      box-shadow:0 1px 2px rgba(0,0,0,0.04); }
     /* Historique des scans */
     .history-toggle { max-width:420px; margin:0 auto; width:100%; padding:12px; border:1px solid var(--gray-200);
       border-radius:12px; background:#fff; color:var(--gray-700); font-weight:600; font-size:14px; cursor:pointer;
@@ -70,7 +73,7 @@
   <header>
     <div class="logo"><span class="b">mc</span><span class="p">2</span><span class="b">i</span><span class="store">Événement</span></div>
     <h1>📷 Scan des badges (live)</h1>
-    <p>Caméra en continu</p>
+    <p>Caméra en continu · <b>v3</b></p>
   </header>
 
   <main>
@@ -83,6 +86,7 @@
     <!-- Étape 2 : scan -->
     <div id="reader" style="display:none"></div>
     <div class="status" id="status"></div>
+    <button class="cancel" id="cancelBtn" style="display:none">✕ Annuler la vérification</button>
     <div class="counter" id="counterBox" style="display:none">
       <div class="ok">Validés<b id="cOk">0</b></div>
       <div class="dup">Déjà scannés<b id="cDup">0</b></div>
@@ -331,28 +335,41 @@
 
       busy = true; elStatus.textContent = 'Vérification…'; pauseLive();
 
-      // Chien de garde : quoi qu'il arrive (réseau suspendu, bug), l'écran
-      // est débloqué après 12 s. Plus jamais de "Vérification…" infini.
+      // Sortie unique de la vérification : résultat, chien de garde (12 s)
+      // ou annulation manuelle via le bouton. Plus jamais de blocage infini.
       var done = false;
-      var watchdog = setTimeout(function () {
+      var cancelBtn = document.getElementById('cancelBtn');
+      cancelBtn.style.display = 'block';
+
+      function finish(r) {
         if (done) return;
         done = true;
-        showResult({ type: 'error', titre: 'Délai dépassé', prenom: '', nom: '', horodatage: '',
+        clearTimeout(watchdog);
+        cancelBtn.style.display = 'none';
+        cancelBtn.onclick = null;
+        if (r) {
+          showResult(r);
+        } else {
+          // Annulation manuelle : on rend la main sans compter le scan.
+          busy = false; lastToken = '';
+          elStatus.textContent = 'Visez un QR Code…';
+          resumeLive();
+        }
+      }
+
+      var watchdog = setTimeout(function () {
+        finish({ type: 'error', titre: 'Délai dépassé', prenom: '', nom: '', horodatage: '',
           message: 'Pas de réponse (réseau lent ?). Rescanne le badge.' });
       }, 12000);
 
+      cancelBtn.onclick = function () { finish(null); };
+
       validerToken(token)
-        .then(function (r) {
-          if (done) return;
-          done = true; clearTimeout(watchdog);
-          showResult(r);
-        })
+        .then(function (r) { finish(r); })
         .catch(function (err) {
-          if (done) return;
-          done = true; clearTimeout(watchdog);
           var m = (err && err.name === 'AbortError') ? 'Réseau trop lent. Rescanne le badge.'
             : 'Accès à la feuille impossible (' + (err && err.message ? err.message : 'erreur') + ').';
-          showResult({ type: 'error', titre: 'Erreur', prenom: '', nom: '', horodatage: '', message: m });
+          finish({ type: 'error', titre: 'Erreur', prenom: '', nom: '', horodatage: '', message: m });
         });
     }
 
