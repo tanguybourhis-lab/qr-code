@@ -56,6 +56,7 @@
     .history-item:last-child { border-bottom:none; }
     .history-item .dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
     .dot-success { background:#059669; } .dot-warning { background:#d97706; } .dot-error { background:#dc2626; }
+    .dot-correction { background:var(--mc2i-blue); }
     .history-item .info { flex:1; min-width:0; }
     .history-item .info .n { font-size:14px; font-weight:600; color:var(--gray-900); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .history-item .info .d { font-size:11px; color:var(--gray-500); }
@@ -80,6 +81,11 @@
     .manual-item .info .d { display:block; font-size:11px; color:var(--gray-500); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .manual-item .validate { padding:8px 14px; border:none; border-radius:8px; background:var(--mc2i-pink);
       color:#fff; font-weight:600; font-size:13px; cursor:pointer; flex-shrink:0; }
+    .manual-item .undo { padding:8px 14px; border:1px solid #fca5a5; border-radius:8px; background:#fff;
+      color:#dc2626; font-weight:600; font-size:13px; cursor:pointer; flex-shrink:0; }
+    .manual-item .undo:disabled, .manual-item .validate:disabled { opacity:.5; }
+    .manual-item .info .st-ok { color:#059669; }
+    .manual-item .info .st-no { color:var(--gray-500); }
     #result { position:fixed; inset:0; z-index:50; display:none; flex-direction:column; align-items:center;
       justify-content:center; padding:24px; text-align:center; cursor:pointer; color:#fff; }
     #result.show { display:flex; }
@@ -89,6 +95,9 @@
     #result .msg { font-size:18px; opacity:.95; }
     #result .ts { margin-top:18px; font-size:15px; background:rgba(255,255,255,.2); padding:8px 14px; border-radius:10px; display:inline-block; }
     #result .tap { margin-top:28px; font-size:13px; opacity:.85; }
+    #result .undo-big { margin-top:22px; padding:12px 18px; border:none; border-radius:10px;
+      background:rgba(255,255,255,.25); color:#fff; font-weight:600; font-size:14px; cursor:pointer; }
+    #result .undo-big:disabled { opacity:.6; }
     .r-success { background:#059669; } .r-warning { background:#d97706; } .r-error { background:#dc2626; }
   </style>
 </head>
@@ -96,7 +105,7 @@
   <header>
     <div class="logo"><span class="b">mc</span><span class="p">2</span><span class="b">i</span><span class="store">Événement</span></div>
     <h1>📷 Scan des badges (live)</h1>
-    <p>Caméra en continu · <b>v7</b></p>
+    <p>Caméra en continu · <b>v9</b></p>
   </header>
 
   <main>
@@ -141,6 +150,7 @@
     <div class="name" id="rName"></div>
     <div class="msg" id="rMsg"></div>
     <div class="ts" id="rTs" style="display:none"></div>
+    <button class="undo-big" id="rUndo" style="display:none">✋ Annuler cette validation</button>
     <div class="tap">Touchez l'écran pour scanner le suivant</div>
   </div>
 
@@ -159,6 +169,20 @@
     // sans lui, l'endpoint userinfo ne renvoie rien.
     var SCOPE = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/userinfo.email';
     /* ============================================================ */
+
+    // Mode répétition / multi-événements : ajouter ?sheet=<ID> à l'URL
+    // remplace le Sheet par défaut (ex. une copie de test, ou le Sheet d'un
+    // autre événement) sans toucher au code. Un bandeau jaune l'affiche en
+    // haut de page pour exclure toute confusion avec la prod.
+    var sheetParam = new URLSearchParams(location.search).get('sheet');
+    if (sheetParam && /^[A-Za-z0-9_-]{20,}$/.test(sheetParam)) {
+      SPREADSHEET_ID = sheetParam;
+      var bandeau = document.createElement('div');
+      bandeau.style.cssText = 'background:#fef3c7;color:#92400e;font-size:12px;font-weight:600;' +
+        'text-align:center;padding:6px 10px;border-bottom:1px solid #fde68a;';
+      bandeau.textContent = '🧪 Sheet personnalisé via URL (…' + SPREADSHEET_ID.substr(-8) + ') — pas le Sheet par défaut';
+      document.body.insertBefore(bandeau, document.body.firstChild);
+    }
 
     // Lettres de colonnes dérivées de COL (pour construire les plages A1)
     var TOKEN_LETTER = String.fromCharCode(65 + COL.TOKEN);       // 'E'
@@ -198,9 +222,10 @@
     window.addEventListener('unhandledrejection', function (e) {
       dbg('❌ PROMESSE REJETÉE NON GÉRÉE:', e.reason);
     });
-    dbg('Page chargée — version v7');
+    dbg('Page chargée — version v9');
 
     var html5Qr = null, liveActive = false, busy = false, lastToken = '', lastTokenTime = 0;
+    var lastValidToken = ''; // token de la dernière validation réussie (pour "Annuler")
     var elStatus = document.getElementById('status');
     var elResult = document.getElementById('result');
 
@@ -482,6 +507,39 @@
       });
     }
 
+    /* ---------- Annulation d'une validation (correction) ----------
+       Efface la cellule Présence (écriture vérifiée par token, comme la
+       validation) et trace une ligne "correction" dans l'onglet Scans :
+       rien n'est jamais supprimé du journal, tout reste auditable. */
+    function annulerPresence(entry, token) {
+      var guardRange = SHEET_NAME + '!' + TOKEN_LETTER + entry.row + ':' + PRESENCE_LETTER + entry.row;
+      return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(guardRange)).then(function (check) {
+        var vals = (check.values && check.values[0]) || [];
+        if (((vals[0] || '') + '').trim() !== token) {
+          tokenIndex = null; // index périmé : sera rechargé au prochain besoin
+          throw new Error('liste réorganisée — relance la recherche');
+        }
+        var cellRange = SHEET_NAME + '!' + PRESENCE_LETTER + entry.row;
+        return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(cellRange) + '?valueInputOption=RAW', {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: [['']] })
+        });
+      }).then(function () {
+        logScanEvent({ type: 'correction', prenom: entry.prenom, nom: entry.nom }, token);
+        addToHistory({ type: 'correction', prenom: entry.prenom, nom: entry.nom, horodatage: horodatageParis() });
+        rafraichirCompteurs(true);
+      });
+    }
+
+    function annulerParToken(token) {
+      var lookup = (tokenIndex && tokenIndex[token])
+        ? Promise.resolve(tokenIndex[token])
+        : chargerIndex().then(function (ix) { return ix[token]; });
+      return lookup.then(function (entry) {
+        if (!entry) throw new Error('invité introuvable');
+        return annulerPresence(entry, token);
+      });
+    }
+
     /* ---------- Compteurs globaux (partagés entre devices) ----------
        - Inscrits : lignes de "Invités" ayant un token (QR généré)
        - Validés  : cellules Présence (G) non vides → l'état réel du Sheet,
@@ -548,6 +606,27 @@
       }).catch(function (e) { dbg('Rafraîchissement compteurs impossible:', e); });
     }
 
+    /* ---------- Écran toujours allumé (Wake Lock) ----------
+       Empêche la mise en veille du téléphone tant que le scanner est
+       ouvert. Supporté par Chrome/Edge Android et iOS Safari ≥ 16.4 ;
+       ailleurs, on l'ignore silencieusement (régler la veille à la main). */
+    var wakeLock = null;
+    function demanderWakeLock() {
+      if (!('wakeLock' in navigator)) { dbg('Wake Lock non supporté par ce navigateur'); return; }
+      navigator.wakeLock.request('screen').then(function (wl) {
+        wakeLock = wl;
+        dbg('Wake Lock actif : écran maintenu allumé');
+        wl.addEventListener('release', function () { dbg('Wake Lock relâché'); });
+      }).catch(function (e) {
+        dbg('Wake Lock refusé:', e);
+      });
+    }
+    // Le système relâche le verrou dès que la page passe en arrière-plan
+    // (changement d'app, écran verrouillé) : on le redemande au retour.
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible' && liveActive) demanderWakeLock();
+    });
+
     /* ---------- Son + vibration ---------- */
     var audioCtx = null;
     function beep(type) {
@@ -597,6 +676,8 @@
         cancelBtn.onclick = null;
         if (r) {
           dbg('Résultat:', r.type, '—', r.titre);
+          // Token gardé pour le bouton "Annuler cette validation" de l'overlay
+          lastValidToken = (r.type === 'success') ? token : '';
           // Journal global des scans (fire-and-forget : ne ralentit pas l'hôte)
           logScanEvent(r, token);
           try {
@@ -645,7 +726,7 @@
     // et history.unshift() lève alors une TypeError qui figeait tout l'écran.
     var scanHistory = [];
     var HISTORY_MAX = 50;
-    var LIBELLES = { success: 'Validé', warning: 'Déjà scanné', error: 'Refusé' };
+    var LIBELLES = { success: 'Validé', warning: 'Déjà scanné', error: 'Refusé', correction: 'Présence annulée' };
 
     function addToHistory(r) {
       var nom = ((r.prenom || '') + ' ' + (r.nom || '')).trim() || 'Inconnu';
@@ -737,7 +818,9 @@
       }
       resBox.innerHTML = '<div class="empty">Recherche…</div>';
 
-      var ready = invitesList ? Promise.resolve() : chargerIndex();
+      // tokenIndex null = index invalidé (liste réorganisée détectée) :
+      // on recharge tout avant de chercher, sinon les lignes seraient fausses.
+      var ready = (invitesList && tokenIndex) ? Promise.resolve() : chargerIndex();
       ready.then(function () {
         var matches = invitesList.filter(function (iv) {
           if (e) return normaliser(iv.email).indexOf(e) >= 0;
@@ -753,6 +836,12 @@
       });
     }
 
+    // Fiche invité : avant affichage, on relit l'état FRAIS de chaque
+    // résultat (présence + vérification du token de ligne) en un seul appel
+    // batchGet. L'hôte voit qui est déjà entré et quand, et l'action
+    // proposée s'adapte : Valider (pas encore arrivé) ou Annuler (correction).
+    var currentResults = [];
+
     function renderManualResults(eligibles, sansToken) {
       var resBox = document.getElementById('manualResults');
       if (eligibles.length === 0) {
@@ -763,28 +852,94 @@
           '</div>';
         return;
       }
-      var html = eligibles.slice(0, 10).map(function (iv) {
+      var shown = eligibles.slice(0, 10);
+      var qs = shown.map(function (iv) {
+        return 'ranges=' + encodeURIComponent(SHEET_NAME + '!' + TOKEN_LETTER + iv.row + ':' + PRESENCE_LETTER + iv.row);
+      }).join('&');
+      authedFetch(SHEETS_BASE + '/values:batchGet?' + qs).then(function (data) {
+        var vr = data.valueRanges || [];
+        shown.forEach(function (iv, i) {
+          var vals = (((vr[i] || {}).values) || [[]])[0] || [];
+          var tokenSurLigne = (vals[0] || '').toString().trim();
+          if (tokenSurLigne !== iv.token) {
+            iv.statut = 'desync';
+            tokenIndex = null; // index périmé : rechargé au prochain besoin
+          } else {
+            iv.presence = (vals[COL.PRESENCE - COL.TOKEN] || '').toString().trim();
+            iv.statut = iv.presence ? 'present' : 'attendu';
+          }
+        });
+        afficherFiches(shown, sansToken, eligibles.length);
+      }).catch(function (err) {
+        // Statuts indisponibles (réseau) : on affiche quand même, la
+        // validation re-vérifie tout de toute façon.
+        dbg('Statuts de la recherche indisponibles:', err);
+        shown.forEach(function (iv) { iv.statut = 'inconnu'; });
+        afficherFiches(shown, sansToken, eligibles.length);
+      });
+    }
+
+    function afficherFiches(shown, sansToken, total) {
+      var resBox = document.getElementById('manualResults');
+      currentResults = shown;
+      var html = shown.map(function (iv, i) {
+        var statutHtml, action;
+        if (iv.statut === 'present') {
+          statutHtml = '<span class="d st-ok">✅ Présent depuis ' + escapeHtml(extraireHorodatage(iv.presence)) + '</span>';
+          action = '<button class="undo" data-i="' + i + '">Annuler</button>';
+        } else if (iv.statut === 'attendu') {
+          statutHtml = '<span class="d st-no">⬜ Pas encore arrivé</span>';
+          action = '<button class="validate" data-i="' + i + '">Valider</button>';
+        } else if (iv.statut === 'desync') {
+          statutHtml = '<span class="d st-no">⚠️ Liste réorganisée — relance la recherche</span>';
+          action = '';
+        } else {
+          statutHtml = '<span class="d st-no">Statut indisponible (réseau)</span>';
+          action = '<button class="validate" data-i="' + i + '">Valider</button>';
+        }
         return '<div class="manual-item">' +
           '<span class="info"><span class="n">' + escapeHtml((iv.prenom + ' ' + iv.nom).trim() || '(sans nom)') + '</span>' +
-          '<span class="d">' + escapeHtml(iv.email) + '</span></span>' +
-          '<button class="validate" data-token="' + escapeHtml(iv.token) + '">Valider</button>' +
+          '<span class="d">' + escapeHtml(iv.email) + '</span>' +
+          statutHtml + '</span>' +
+          action +
           '</div>';
       }).join('');
-      if (eligibles.length > 10) {
-        html += '<div class="empty">+ ' + (eligibles.length - 10) + ' autre(s) résultat(s) — affine la recherche.</div>';
+      if (total > shown.length) {
+        html += '<div class="empty">+ ' + (total - shown.length) + ' autre(s) résultat(s) — affine la recherche.</div>';
       }
       if (sansToken > 0) {
         html += '<div class="empty"><small>' + sansToken + ' correspondance(s) sans token non affichée(s).</small></div>';
       }
       resBox.innerHTML = html;
+
       Array.prototype.forEach.call(resBox.querySelectorAll('button.validate'), function (btn) {
         btn.addEventListener('click', function () {
           if (busy) { elStatus.textContent = 'Une vérification est déjà en cours…'; return; }
-          var tk = this.getAttribute('data-token');
-          dbg('Validation manuelle pour', tk.substr(0, 8) + '…');
+          var iv = currentResults[+this.getAttribute('data-i')];
+          dbg('Validation manuelle pour', iv.token.substr(0, 8) + '…');
           fermerManuel();
           // Même circuit que le scan d'un QR Code (contrôles + journal).
-          onDecoded(tk, true);
+          onDecoded(iv.token, true);
+        });
+      });
+
+      Array.prototype.forEach.call(resBox.querySelectorAll('button.undo'), function (btn) {
+        btn.addEventListener('click', function () {
+          var iv = currentResults[+this.getAttribute('data-i')];
+          var nomComplet = (iv.prenom + ' ' + iv.nom).trim() || iv.email;
+          // Confirmation explicite : annuler une présence est une correction
+          // volontaire, pas un geste de flux.
+          if (!confirm('Annuler la présence de ' + nomComplet + ' ?\n(Arrivé : ' + extraireHorodatage(iv.presence) + ')')) return;
+          var b = this;
+          b.disabled = true; b.textContent = '…';
+          annulerPresence(iv, iv.token).then(function () {
+            dbg('Présence annulée (recherche):', nomComplet);
+            rechercherInvites(); // ré-affiche la fiche avec le statut à jour
+          }).catch(function (e2) {
+            dbg('Annulation impossible:', e2);
+            b.disabled = false; b.textContent = 'Annuler';
+            alert('Annulation impossible (' + ((e2 && e2.message) || 'erreur') + '). Réessaie.');
+          });
         });
       });
     }
@@ -814,11 +969,41 @@
       if (r.type === 'warning' && r.horodatage) { tsEl.textContent = '🕒 Premier scan : ' + r.horodatage; tsEl.style.display = 'inline-block'; }
       else if (r.type === 'success' && r.horodatage) { tsEl.textContent = '🕒 ' + r.horodatage; tsEl.style.display = 'inline-block'; }
       else { tsEl.style.display = 'none'; }
+      // Bouton "Annuler" : uniquement après une validation réussie sur CE
+      // device (corrige un mauvais clic en validation manuelle, ou un badge
+      // présenté par erreur). L'overlay reste alors un peu plus longtemps.
+      var undoBtn = document.getElementById('rUndo');
+      var avecUndo = (r.type === 'success' && lastValidToken);
+      undoBtn.style.display = avecUndo ? 'inline-block' : 'none';
+      undoBtn.disabled = false;
+      undoBtn.textContent = '✋ Annuler cette validation';
       elResult.className = 'show r-' + r.type;
       beep(r.type); vibrate(r.type);
       clearTimeout(window._resumeTimer);
-      window._resumeTimer = setTimeout(closeResult, 3000);
+      window._resumeTimer = setTimeout(closeResult, avecUndo ? 4500 : 3000);
     }
+
+    document.getElementById('rUndo').addEventListener('click', function (ev) {
+      ev.stopPropagation(); // ne pas fermer l'overlay via le tap global
+      var btn = this, tk = lastValidToken;
+      if (!tk) return;
+      clearTimeout(window._resumeTimer); // on fige l'overlay pendant l'annulation
+      btn.disabled = true;
+      btn.textContent = 'Annulation…';
+      annulerParToken(tk).then(function () {
+        dbg('Validation annulée (overlay) pour', tk.substr(0, 8) + '…');
+        lastValidToken = '';
+        lastToken = ''; // autorise un re-scan immédiat du même badge
+        closeResult();
+        rafraichirCompteurs(true);
+        elStatus.textContent = '↩️ Validation annulée.';
+      }).catch(function (e) {
+        dbg('Annulation impossible:', e);
+        btn.disabled = false;
+        btn.textContent = '⚠️ Échec — réessaie';
+        // L'overlay reste ouvert : l'hôte peut retenter ou fermer d'un tap.
+      });
+    });
 
     function closeResult() {
       clearTimeout(window._resumeTimer);
@@ -859,7 +1044,10 @@
       html5Qr = new Html5Qrcode('reader', { verbose: false });
       html5Qr.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 240, height: 240 }, aspectRatio: 1.0 },
         function (txt) { onDecoded(txt); }, function () {}
-      ).then(function () { liveActive = true; dbg('Caméra démarrée'); elStatus.textContent = 'Visez un QR Code…'; })
+      ).then(function () {
+        liveActive = true; dbg('Caméra démarrée'); elStatus.textContent = 'Visez un QR Code…';
+        demanderWakeLock(); // l'écran ne doit pas s'éteindre pendant l'événement
+      })
        .catch(function (err) {
          liveActive = false;
          dbg('Caméra KO:', err);
