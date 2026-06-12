@@ -27,10 +27,11 @@
       box-shadow:0 1px 3px rgba(0,0,0,0.08); border:1px solid var(--gray-200); }
     #reader video { display:block; width:100% !important; }
     .status { text-align:center; font-size:13px; color:var(--gray-500); min-height:18px; }
-    .counter { max-width:420px; margin:0 auto; width:100%; display:flex; gap:10px; }
-    .counter div { flex:1; background:#fff; border:1px solid var(--gray-200); border-radius:12px; padding:10px 6px;
-      text-align:center; font-size:12px; color:var(--gray-500); box-shadow:0 1px 2px rgba(0,0,0,0.04); }
+    .counter { max-width:420px; margin:0 auto; width:100%; display:flex; gap:8px; }
+    .counter div { flex:1; background:#fff; border:1px solid var(--gray-200); border-radius:12px; padding:10px 4px;
+      text-align:center; font-size:11px; color:var(--gray-500); box-shadow:0 1px 2px rgba(0,0,0,0.04); }
     .counter b { display:block; font-size:20px; margin-bottom:2px; }
+    .counter .tot b { color:var(--mc2i-blue); }
     .counter .ok b { color:#059669; } .counter .dup b { color:#d97706; } .counter .ko b { color:#dc2626; }
     .connect { max-width:420px; margin:24px auto 0; width:100%; background:#fff; border:1px solid var(--gray-200);
       border-radius:16px; padding:24px; text-align:center; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
@@ -73,7 +74,7 @@
   <header>
     <div class="logo"><span class="b">mc</span><span class="p">2</span><span class="b">i</span><span class="store">Événement</span></div>
     <h1>📷 Scan des badges (live)</h1>
-    <p>Caméra en continu · <b>v4</b></p>
+    <p>Caméra en continu · <b>v5</b></p>
   </header>
 
   <main>
@@ -88,9 +89,10 @@
     <div class="status" id="status"></div>
     <button class="cancel" id="cancelBtn" style="display:none">✕ Annuler la vérification</button>
     <div class="counter" id="counterBox" style="display:none">
-      <div class="ok">Validés<b id="cOk">0</b></div>
-      <div class="dup">Déjà scannés<b id="cDup">0</b></div>
-      <div class="ko">Refusés<b id="cKo">0</b></div>
+      <div class="tot">Inscrits<b id="cTot">–</b></div>
+      <div class="ok">Validés<b id="cOk">–</b></div>
+      <div class="dup">Déjà scannés<b id="cDup">–</b></div>
+      <div class="ko">Refusés<b id="cKo">–</b></div>
     </div>
     <button class="history-toggle" id="historyToggle" style="display:none">🕒 Historique des scans</button>
     <div class="history" id="historyBox" style="display:none"></div>
@@ -157,10 +159,9 @@
     window.addEventListener('unhandledrejection', function (e) {
       dbg('❌ PROMESSE REJETÉE NON GÉRÉE:', e.reason);
     });
-    dbg('Page chargée — version v4');
+    dbg('Page chargée — version v5');
 
     var html5Qr = null, liveActive = false, busy = false, lastToken = '', lastTokenTime = 0;
-    var counts = { ok: 0, dup: 0, ko: 0 };
     var elStatus = document.getElementById('status');
     var elResult = document.getElementById('result');
 
@@ -244,6 +245,7 @@
         .then(function (r) { return r.json(); })
         .then(function (u) {
           var qui = u.email || u.name || '';
+          hostEmail = u.email || ''; // tracé dans le journal des scans
           if (qui) { box.textContent = 'Connecté : ' + qui; box.style.display = 'block'; }
         })
         .catch(function () { /* on n'affiche rien plutôt qu'un "Connecté :" vide */ });
@@ -362,6 +364,68 @@
       });
     }
 
+    /* ---------- Compteurs globaux (partagés entre devices) ----------
+       - Inscrits : lignes de "Invités" ayant un token (QR généré)
+       - Validés  : cellules Présence (G) non vides → l'état réel du Sheet,
+         quel que soit le device qui a scanné
+       - Déjà scannés / Refusés : événements qui n'existent pas dans la
+         feuille Invités → chaque device les journalise dans l'onglet
+         "Scans" (créé automatiquement), qui sert aussi d'audit global. */
+    var STATS_SHEET = 'Scans';
+    var TOKEN_LETTER = String.fromCharCode(65 + COL.TOKEN);       // 'E'
+    var PRESENCE_LETTER = String.fromCharCode(65 + COL.PRESENCE); // 'G'
+    var hostEmail = '';
+    var statsTimer = null;
+
+    function ensureScansSheet() {
+      return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(STATS_SHEET + '!A1')).catch(function () {
+        dbg('Onglet "' + STATS_SHEET + '" absent → création');
+        return authedFetch(SHEETS_BASE + ':batchUpdate', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ requests: [{ addSheet: { properties: { title: STATS_SHEET } } }] })
+        }).then(function () {
+          return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(STATS_SHEET + '!A1:E1') + '?valueInputOption=RAW', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ values: [['Horodatage', 'Type', 'Invité', 'Token', 'Hôte']] })
+          });
+        }).catch(function (e) { dbg('Création onglet Scans impossible:', e); });
+      });
+    }
+
+    // Journalise un scan dans l'onglet "Scans". L'append de l'API Sheets est
+    // sûr en concurrence : deux devices ne s'écrasent jamais.
+    function logScanEvent(r, token) {
+      var body = { values: [[horodatageParis(), r.type, ((r.prenom || '') + ' ' + (r.nom || '')).trim(), token, hostEmail]] };
+      return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(STATS_SHEET + '!A:E') + ':append?valueInputOption=RAW&insertDataOption=INSERT_ROWS', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      }).catch(function (e) { dbg('Journalisation du scan impossible:', e); });
+    }
+
+    // Recharge les 4 compteurs depuis le Sheet (1 seul appel batchGet).
+    function rafraichirCompteurs() {
+      if (busy) return; // jamais en concurrence avec une vérification
+      var url = SHEETS_BASE + '/values:batchGet' +
+        '?ranges=' + encodeURIComponent(SHEET_NAME + '!' + TOKEN_LETTER + '2:' + TOKEN_LETTER) +
+        '&ranges=' + encodeURIComponent(SHEET_NAME + '!' + PRESENCE_LETTER + '2:' + PRESENCE_LETTER) +
+        '&ranges=' + encodeURIComponent(STATS_SHEET + '!B2:B');
+      authedFetch(url).then(function (data) {
+        var vr = data.valueRanges || [];
+        var nonVide = function (range) {
+          return (((range || {}).values) || []).filter(function (row) { return (row[0] || '').toString().trim(); }).length;
+        };
+        var dup = 0, refus = 0;
+        ((((vr[2]) || {}).values) || []).forEach(function (row) {
+          if (row[0] === 'warning') dup++;
+          else if (row[0] === 'error') refus++;
+        });
+        document.getElementById('cTot').textContent = nonVide(vr[0]);
+        document.getElementById('cOk').textContent = nonVide(vr[1]);
+        document.getElementById('cDup').textContent = dup;
+        document.getElementById('cKo').textContent = refus;
+        dbg('Compteurs:', nonVide(vr[0]), 'inscrits,', nonVide(vr[1]), 'validés,', dup, 'doublons,', refus, 'refusés');
+      }).catch(function (e) { dbg('Rafraîchissement compteurs impossible:', e); });
+    }
+
     /* ---------- Son + vibration ---------- */
     var audioCtx = null;
     function beep(type) {
@@ -404,6 +468,8 @@
         cancelBtn.onclick = null;
         if (r) {
           dbg('Résultat:', r.type, '—', r.titre);
+          // Journal global des scans (fire-and-forget : ne ralentit pas l'hôte)
+          logScanEvent(r, token);
           try {
             showResult(r);
           } catch (ex) {
@@ -490,14 +556,20 @@
     function showResult(r) {
       r = r || { type: 'error', titre: 'Erreur', message: '', prenom: '', nom: '', horodatage: '' };
       var emojis = { success: '✅', warning: '⚠️', error: '❌' };
-      if (r.type === 'success') counts.ok++; else if (r.type === 'warning') counts.dup++; else counts.ko++;
       // Après une erreur (réseau, délai…), on autorise le re-scan immédiat
       // du même badge sans attendre la fenêtre anti-double-scan de 4 s.
       if (r.type === 'error') lastToken = '';
       addToHistory(r);
-      document.getElementById('cOk').textContent = counts.ok;
-      document.getElementById('cDup').textContent = counts.dup;
-      document.getElementById('cKo').textContent = counts.ko;
+      // Incrément optimiste pour un retour immédiat ; les vraies valeurs
+      // globales (tous devices) sont resynchronisées depuis le Sheet juste
+      // après, par rafraichirCompteurs().
+      var bump = function (id) {
+        var el = document.getElementById(id);
+        el.textContent = (parseInt(el.textContent, 10) || 0) + 1;
+      };
+      if (r.type === 'success') bump('cOk');
+      else if (r.type === 'warning') bump('cDup');
+      else bump('cKo');
       document.getElementById('rEmoji').textContent = emojis[r.type] || '❌';
       document.getElementById('rTitre').textContent = r.titre || '';
       document.getElementById('rName').textContent = ((r.prenom || '') + ' ' + (r.nom || '')).trim();
@@ -517,6 +589,8 @@
       elResult.className = ''; busy = false;
       elStatus.textContent = 'Visez un QR Code…';
       resumeLive();
+      // Resynchronise les compteurs globaux (intègre l'activité des autres devices)
+      rafraichirCompteurs();
     }
 
     function pauseLive() { if (html5Qr && liveActive) { try { html5Qr.pause(true); } catch (e) {} } }
@@ -535,6 +609,15 @@
       // Préchargement de la liste des invités pendant que la caméra
       // s'initialise : le premier scan sera aussi rapide que les suivants.
       chargerIndex().catch(function () { /* sera retenté au premier scan */ });
+
+      // Onglet de journalisation + compteurs globaux partagés entre devices,
+      // rafraîchis toutes les 30 s (et après chaque scan via closeResult).
+      ensureScansSheet().then(rafraichirCompteurs);
+      if (!statsTimer) {
+        statsTimer = setInterval(function () {
+          if (liveActive && !busy && document.visibilityState === 'visible') rafraichirCompteurs();
+        }, 30000);
+      }
 
       html5Qr = new Html5Qrcode('reader', { verbose: false });
       html5Qr.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 240, height: 240 }, aspectRatio: 1.0 },
