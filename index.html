@@ -58,6 +58,26 @@
     .history-item .info .n { font-size:14px; font-weight:600; color:var(--gray-900); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .history-item .info .d { font-size:11px; color:var(--gray-500); }
     .history-item .t { font-size:11px; color:var(--gray-400); white-space:nowrap; }
+    /* Validation manuelle (invité sans QR Code) */
+    .manual-toggle { color:var(--mc2i-blue); }
+    .manual { max-width:420px; margin:0 auto; width:100%; background:#fff; border:1px solid var(--gray-200);
+      border-radius:12px; box-shadow:0 1px 2px rgba(0,0,0,0.04); overflow:hidden; }
+    .manual-form { padding:12px; display:flex; flex-direction:column; gap:8px; border-bottom:1px solid var(--gray-200); }
+    .manual-form .row2 { display:flex; gap:8px; }
+    .manual-form input { flex:1; width:100%; padding:10px; border:1px solid var(--gray-200); border-radius:8px;
+      font-size:14px; font-family:inherit; }
+    .manual-form input:focus { outline:none; border-color:var(--mc2i-blue); }
+    .manual-form .or { text-align:center; font-size:11px; color:var(--gray-400); }
+    .manual-form button { padding:12px; border:none; border-radius:10px; background:var(--mc2i-blue); color:#fff;
+      font-weight:600; font-size:14px; cursor:pointer; }
+    .manual .empty { padding:14px; font-size:13px; color:var(--gray-400); text-align:center; line-height:1.5; }
+    .manual-item { display:flex; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid #f3f4f6; }
+    .manual-item:last-child { border-bottom:none; }
+    .manual-item .info { flex:1; min-width:0; }
+    .manual-item .info .n { display:block; font-size:14px; font-weight:600; color:var(--gray-900); }
+    .manual-item .info .d { display:block; font-size:11px; color:var(--gray-500); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .manual-item .validate { padding:8px 14px; border:none; border-radius:8px; background:var(--mc2i-pink);
+      color:#fff; font-weight:600; font-size:13px; cursor:pointer; flex-shrink:0; }
     #result { position:fixed; inset:0; z-index:50; display:none; flex-direction:column; align-items:center;
       justify-content:center; padding:24px; text-align:center; cursor:pointer; color:#fff; }
     #result.show { display:flex; }
@@ -74,7 +94,7 @@
   <header>
     <div class="logo"><span class="b">mc</span><span class="p">2</span><span class="b">i</span><span class="store">Événement</span></div>
     <h1>📷 Scan des badges (live)</h1>
-    <p>Caméra en continu · <b>v5</b></p>
+    <p>Caméra en continu · <b>v6</b></p>
   </header>
 
   <main>
@@ -93,6 +113,19 @@
       <div class="ok">Validés<b id="cOk">–</b></div>
       <div class="dup">Déjà scannés<b id="cDup">–</b></div>
       <div class="ko">Refusés<b id="cKo">–</b></div>
+    </div>
+    <button class="history-toggle manual-toggle" id="manualToggle" style="display:none">👤 Valider sans QR Code</button>
+    <div class="manual" id="manualBox" style="display:none">
+      <div class="manual-form">
+        <div class="row2">
+          <input type="text" id="mPrenom" placeholder="Prénom" autocomplete="off">
+          <input type="text" id="mNom" placeholder="Nom" autocomplete="off">
+        </div>
+        <div class="or">— ou —</div>
+        <input type="email" id="mEmail" placeholder="Email" autocomplete="off">
+        <button id="manualSearch">🔍 Rechercher l'invité</button>
+      </div>
+      <div id="manualResults"></div>
     </div>
     <button class="history-toggle" id="historyToggle" style="display:none">🕒 Historique des scans</button>
     <div class="history" id="historyBox" style="display:none"></div>
@@ -118,7 +151,7 @@
     var SPREADSHEET_ID = '1oxZfPISL-aFa6ZLyFNVo9xWs7mUOLRKWC7DKcVteWVc';
     // 3) Nom de l'onglet et colonnes (par défaut conformes au projet)
     var SHEET_NAME = 'Invités';
-    var COL = { PRENOM: 1, NOM: 2, TOKEN: 4, PRESENCE: 6 }; // index 0-based (A=0, B=1, ...)
+    var COL = { EMAIL: 0, PRENOM: 1, NOM: 2, TOKEN: 4, PRESENCE: 6 }; // index 0-based (A=0, B=1, ...)
     // Le scope userinfo.email permet d'afficher "Connecté : <email>" ;
     // sans lui, l'endpoint userinfo ne renvoie rien.
     var SCOPE = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/userinfo.email';
@@ -159,7 +192,7 @@
     window.addEventListener('unhandledrejection', function (e) {
       dbg('❌ PROMESSE REJETÉE NON GÉRÉE:', e.reason);
     });
-    dbg('Page chargée — version v5');
+    dbg('Page chargée — version v6');
 
     var html5Qr = null, liveActive = false, busy = false, lastToken = '', lastTokenTime = 0;
     var elStatus = document.getElementById('status');
@@ -313,17 +346,21 @@
       return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(readRange)).then(function (data) {
         var rows = data.values || [];
         tokenIndex = {};
+        invitesList = [];
         for (var i = 0; i < rows.length; i++) {
-          var t = (rows[i][COL.TOKEN] || '').toString().trim();
-          if (t) {
-            tokenIndex[t] = {
-              row: i + 2, // A2 = ligne 2
-              prenom: (rows[i][COL.PRENOM] || '').toString().trim(),
-              nom: (rows[i][COL.NOM] || '').toString().trim()
-            };
-          }
+          var entry = {
+            row: i + 2, // A2 = ligne 2
+            prenom: (rows[i][COL.PRENOM] || '').toString().trim(),
+            nom: (rows[i][COL.NOM] || '').toString().trim(),
+            email: (rows[i][COL.EMAIL] || '').toString().trim(),
+            token: (rows[i][COL.TOKEN] || '').toString().trim()
+          };
+          if (entry.token) tokenIndex[entry.token] = entry;
+          // On garde aussi les invités SANS token : la recherche manuelle
+          // s'en sert pour expliquer pourquoi quelqu'un n'est pas éligible.
+          invitesList.push(entry);
         }
-        dbg('Index chargé:', Object.keys(tokenIndex).length, 'token(s)');
+        dbg('Index chargé:', Object.keys(tokenIndex).length, 'token(s) /', invitesList.length, 'invité(s)');
         return tokenIndex;
       });
     }
@@ -553,6 +590,108 @@
       if (!visible) renderHistory();
     });
 
+    /* ---------- Validation manuelle (invité sans QR Code) ----------
+       Pour les invités qui n'ont pas leur badge (mail non reçu/perdu,
+       batterie vide…). Recherche par Prénom + Nom (les deux requis) OU par
+       Email, uniquement parmi les invités possédant un token. La validation
+       emprunte ensuite le MÊME circuit que le scan d'un QR : mêmes
+       contrôles "déjà scanné", même garde anti-concurrence, même journal,
+       mêmes compteurs. La recherche est locale (index en mémoire) : 0 appel
+       réseau, résultat instantané. */
+    var invitesList = null;
+
+    function normaliser(s) {
+      // NFD décompose les lettres accentuées ("é" → "e" + accent combinant),
+      // puis on retire les accents (plage Unicode des diacritiques).
+      return (s || '').toString().toLowerCase()
+        .normalize('NFD').replace(new RegExp('[\\u0300-\\u036f]', 'g'), '').trim();
+    }
+
+    function fermerManuel() {
+      document.getElementById('manualBox').style.display = 'none';
+      document.getElementById('manualToggle').textContent = '👤 Valider sans QR Code';
+    }
+
+    document.getElementById('manualToggle').addEventListener('click', function () {
+      var box = document.getElementById('manualBox');
+      var visible = box.style.display !== 'none';
+      box.style.display = visible ? 'none' : 'block';
+      this.textContent = visible ? '👤 Valider sans QR Code' : '👤 Fermer la validation manuelle';
+      // Précharge la liste si besoin pour que la recherche soit instantanée.
+      if (!visible && !invitesList) chargerIndex().catch(function () {});
+    });
+
+    document.getElementById('manualSearch').addEventListener('click', rechercherInvites);
+    ['mPrenom', 'mNom', 'mEmail'].forEach(function (id) {
+      document.getElementById(id).addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); rechercherInvites(); }
+      });
+    });
+
+    function rechercherInvites() {
+      var p = normaliser(document.getElementById('mPrenom').value);
+      var n = normaliser(document.getElementById('mNom').value);
+      var e = normaliser(document.getElementById('mEmail').value);
+      var resBox = document.getElementById('manualResults');
+
+      // Règle métier : soit Prénom ET Nom (indissociables), soit Email seul.
+      if (!e && !(p && n)) {
+        resBox.innerHTML = '<div class="empty">Renseigne <b>Prénom et Nom</b> (les deux), ou l\'<b>Email</b> seul.</div>';
+        return;
+      }
+      resBox.innerHTML = '<div class="empty">Recherche…</div>';
+
+      var ready = invitesList ? Promise.resolve() : chargerIndex();
+      ready.then(function () {
+        var matches = invitesList.filter(function (iv) {
+          if (e) return normaliser(iv.email).indexOf(e) >= 0;
+          return normaliser(iv.prenom).indexOf(p) >= 0 && normaliser(iv.nom).indexOf(n) >= 0;
+        });
+        // Seuls les invités possédant un token sont éligibles.
+        var eligibles = matches.filter(function (iv) { return iv.token; });
+        dbg('Recherche manuelle:', matches.length, 'correspondance(s) dont', eligibles.length, 'avec token');
+        renderManualResults(eligibles, matches.length - eligibles.length);
+      }).catch(function (err) {
+        dbg('Recherche manuelle impossible:', err);
+        resBox.innerHTML = '<div class="empty">⚠️ Liste des invités inaccessible (réseau). Réessaie.</div>';
+      });
+    }
+
+    function renderManualResults(eligibles, sansToken) {
+      var resBox = document.getElementById('manualResults');
+      if (eligibles.length === 0) {
+        resBox.innerHTML = '<div class="empty">Aucun invité éligible trouvé.' +
+          (sansToken > 0
+            ? '<br><small>' + sansToken + ' correspondance(s) <b>sans token</b> (badge jamais généré) — non éligible(s).</small>'
+            : '') +
+          '</div>';
+        return;
+      }
+      var html = eligibles.slice(0, 10).map(function (iv) {
+        return '<div class="manual-item">' +
+          '<span class="info"><span class="n">' + escapeHtml((iv.prenom + ' ' + iv.nom).trim() || '(sans nom)') + '</span>' +
+          '<span class="d">' + escapeHtml(iv.email) + '</span></span>' +
+          '<button class="validate" data-token="' + escapeHtml(iv.token) + '">Valider</button>' +
+          '</div>';
+      }).join('');
+      if (eligibles.length > 10) {
+        html += '<div class="empty">+ ' + (eligibles.length - 10) + ' autre(s) résultat(s) — affine la recherche.</div>';
+      }
+      if (sansToken > 0) {
+        html += '<div class="empty"><small>' + sansToken + ' correspondance(s) sans token non affichée(s).</small></div>';
+      }
+      resBox.innerHTML = html;
+      Array.prototype.forEach.call(resBox.querySelectorAll('button.validate'), function (btn) {
+        btn.addEventListener('click', function () {
+          var tk = this.getAttribute('data-token');
+          dbg('Validation manuelle pour', tk.substr(0, 8) + '…');
+          fermerManuel();
+          // Même circuit que le scan d'un QR Code (contrôles + journal).
+          onDecoded(tk);
+        });
+      });
+    }
+
     function showResult(r) {
       r = r || { type: 'error', titre: 'Erreur', message: '', prenom: '', nom: '', horodatage: '' };
       var emojis = { success: '✅', warning: '⚠️', error: '❌' };
@@ -603,6 +742,7 @@
       }
       document.getElementById('reader').style.display = 'block';
       document.getElementById('counterBox').style.display = 'flex';
+      document.getElementById('manualToggle').style.display = 'block';
       document.getElementById('historyToggle').style.display = 'block';
       elStatus.textContent = 'Démarrage de la caméra…';
 
