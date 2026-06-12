@@ -143,6 +143,12 @@
           } else {
             ws.forEach(function (w) { w.reject(new Error('auth')); });
           }
+        },
+        // Sans ce handler, une popup bloquée par le navigateur mobile
+        // laissait les promesses en attente pour toujours.
+        error_callback: function () {
+          var ws = tokenWaiters; tokenWaiters = [];
+          ws.forEach(function (w) { w.reject(new Error('auth')); });
         }
       });
     }
@@ -151,7 +157,16 @@
       return new Promise(function (resolve, reject) {
         if (accessToken && !forcePrompt) { resolve(accessToken); return; }
         if (!tokenClient) { reject(new Error('gis')); return; }
-        tokenWaiters.push({ resolve: resolve, reject: reject });
+        var w = { resolve: resolve, reject: reject };
+        tokenWaiters.push(w);
+        // Le refresh silencieux peut ne jamais répondre sur mobile :
+        // on abandonne après 10 s plutôt que de bloquer le scan.
+        if (!forcePrompt) {
+          setTimeout(function () {
+            var idx = tokenWaiters.indexOf(w);
+            if (idx >= 0) { tokenWaiters.splice(idx, 1); reject(new Error('auth-timeout')); }
+          }, 10000);
+        }
         tokenClient.requestAccessToken({ prompt: forcePrompt ? 'consent' : '' });
       });
     }
@@ -193,10 +208,17 @@
     }
 
     /* ---------- Appels API Sheets (avec refresh auto du token) ---------- */
+    // Chaque appel est plafonné à 8 s : sur un réseau mobile instable, un
+    // fetch sans timeout peut rester suspendu indéfiniment et figer le scan.
     function authedFetch(url, opts, retried) {
       opts = opts || {};
       opts.headers = opts.headers || {};
       opts.headers['Authorization'] = 'Bearer ' + accessToken;
+      if (typeof AbortController !== 'undefined') {
+        var ctrl = new AbortController();
+        opts.signal = ctrl.signal;
+        setTimeout(function () { ctrl.abort(); }, 8000);
+      }
       return fetch(url, opts).then(function (res) {
         if (res.status === 401 && !retried) {
           accessToken = null;
@@ -221,47 +243,64 @@
       return m ? m[0] : s;
     }
 
+    /* ---------- Index des invités (cache token → ligne) ---------- */
+    // La liste est lue UNE fois au démarrage. Chaque scan ne fait ensuite
+    // que 2 petits appels (relire la cellule G, puis l'écrire) au lieu de
+    // recharger toute la feuille : beaucoup plus rapide sur réseau mobile.
+    // Les tokens ne changent jamais de ligne ; si un token est introuvable
+    // (invité ajouté après le démarrage), on recharge l'index une fois.
+    var tokenIndex = null;
+
+    function chargerIndex() {
+      var readRange = SHEET_NAME + '!A2:G';
+      return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(readRange)).then(function (data) {
+        var rows = data.values || [];
+        tokenIndex = {};
+        for (var i = 0; i < rows.length; i++) {
+          var t = (rows[i][COL.TOKEN] || '').toString().trim();
+          if (t) {
+            tokenIndex[t] = {
+              row: i + 2, // A2 = ligne 2
+              prenom: (rows[i][COL.PRENOM] || '').toString().trim(),
+              nom: (rows[i][COL.NOM] || '').toString().trim()
+            };
+          }
+        }
+        return tokenIndex;
+      });
+    }
+
     /* ---------- Validation (équivalent client de validerToken) ---------- */
     function validerToken(token) {
       token = (token || '').toString().trim();
       if (!UUID_RE.test(token)) {
         return Promise.resolve({ type: 'error', titre: 'QR Code invalide', prenom: '', nom: '', horodatage: '', message: 'Format de badge incorrect.' });
       }
-      var readRange = SHEET_NAME + '!A2:G';
-      return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(readRange)).then(function (data) {
-        var rows = data.values || [];
-        for (var i = 0; i < rows.length; i++) {
-          var row = rows[i];
-          if ((row[COL.TOKEN] || '').toString() === token) {
-            var prenom = (row[COL.PRENOM] || '').toString().trim();
-            var nom = (row[COL.NOM] || '').toString().trim();
-            var presence = (row[COL.PRESENCE] || '').toString().trim();
-            if (presence) {
-              return { type: 'warning', titre: 'Badge déjà scanné', prenom: prenom, nom: nom,
-                horodatage: extraireHorodatage(presence), message: 'Ce badge a déjà été enregistré.' };
-            }
-            var ts = horodatageParis();
-            var rowNumber = i + 2; // A2 = ligne 2
-            var cellRange = SHEET_NAME + '!G' + rowNumber;
-            // Garde anti-concurrence : on relit la cellule G juste avant
-            // d'écrire. Si un autre hôte a validé ce badge entre notre
-            // lecture initiale et maintenant, on bascule en "déjà scanné"
-            // au lieu d'écraser son horodatage.
-            return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(cellRange)).then(function (check) {
-              var current = ((check.values && check.values[0] && check.values[0][0]) || '').toString().trim();
-              if (current) {
-                return { type: 'warning', titre: 'Badge déjà scanné', prenom: prenom, nom: nom,
-                  horodatage: extraireHorodatage(current), message: 'Ce badge a déjà été enregistré.' };
-              }
-              return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(cellRange) + '?valueInputOption=RAW', {
-                method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: [[ts]] })
-              }).then(function () {
-                return { type: 'success', titre: 'Bienvenue !', prenom: prenom, nom: nom, horodatage: ts, message: 'Présence confirmée.' };
-              });
-            });
-          }
+      // Token connu → on évite la relecture complète de la feuille.
+      var lookup = (tokenIndex && tokenIndex[token])
+        ? Promise.resolve(tokenIndex[token])
+        : chargerIndex().then(function (ix) { return ix[token]; });
+
+      return lookup.then(function (entry) {
+        if (!entry) {
+          return { type: 'error', titre: 'Badge non reconnu', prenom: '', nom: '', horodatage: '', message: "Ce QR Code n'est pas dans la liste des invités." };
         }
-        return { type: 'error', titre: 'Badge non reconnu', prenom: '', nom: '', horodatage: '', message: "Ce QR Code n'est pas dans la liste des invités." };
+        var cellRange = SHEET_NAME + '!G' + entry.row;
+        // Lecture "fraîche" de la cellule G : sert à la fois de détection
+        // "déjà scanné" et de garde anti-concurrence entre plusieurs hôtes.
+        return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(cellRange)).then(function (check) {
+          var current = ((check.values && check.values[0] && check.values[0][0]) || '').toString().trim();
+          if (current) {
+            return { type: 'warning', titre: 'Badge déjà scanné', prenom: entry.prenom, nom: entry.nom,
+              horodatage: extraireHorodatage(current), message: 'Ce badge a déjà été enregistré.' };
+          }
+          var ts = horodatageParis();
+          return authedFetch(SHEETS_BASE + '/values/' + encodeURIComponent(cellRange) + '?valueInputOption=RAW', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: [[ts]] })
+          }).then(function () {
+            return { type: 'success', titre: 'Bienvenue !', prenom: entry.prenom, nom: entry.nom, horodatage: ts, message: 'Présence confirmée.' };
+          });
+        });
       });
     }
 
@@ -291,11 +330,29 @@
       lastToken = token; lastTokenTime = now;
 
       busy = true; elStatus.textContent = 'Vérification…'; pauseLive();
+
+      // Chien de garde : quoi qu'il arrive (réseau suspendu, bug), l'écran
+      // est débloqué après 12 s. Plus jamais de "Vérification…" infini.
+      var done = false;
+      var watchdog = setTimeout(function () {
+        if (done) return;
+        done = true;
+        showResult({ type: 'error', titre: 'Délai dépassé', prenom: '', nom: '', horodatage: '',
+          message: 'Pas de réponse (réseau lent ?). Rescanne le badge.' });
+      }, 12000);
+
       validerToken(token)
-        .then(showResult)
+        .then(function (r) {
+          if (done) return;
+          done = true; clearTimeout(watchdog);
+          showResult(r);
+        })
         .catch(function (err) {
-          showResult({ type: 'error', titre: 'Erreur', prenom: '', nom: '', horodatage: '',
-            message: 'Accès à la feuille impossible (' + (err && err.message ? err.message : 'erreur') + ').' });
+          if (done) return;
+          done = true; clearTimeout(watchdog);
+          var m = (err && err.name === 'AbortError') ? 'Réseau trop lent. Rescanne le badge.'
+            : 'Accès à la feuille impossible (' + (err && err.message ? err.message : 'erreur') + ').';
+          showResult({ type: 'error', titre: 'Erreur', prenom: '', nom: '', horodatage: '', message: m });
         });
     }
 
@@ -347,6 +404,9 @@
       r = r || { type: 'error', titre: 'Erreur', message: '', prenom: '', nom: '', horodatage: '' };
       var emojis = { success: '✅', warning: '⚠️', error: '❌' };
       if (r.type === 'success') counts.ok++; else if (r.type === 'warning') counts.dup++; else counts.ko++;
+      // Après une erreur (réseau, délai…), on autorise le re-scan immédiat
+      // du même badge sans attendre la fenêtre anti-double-scan de 4 s.
+      if (r.type === 'error') lastToken = '';
       addToHistory(r);
       document.getElementById('cOk').textContent = counts.ok;
       document.getElementById('cDup').textContent = counts.dup;
@@ -384,6 +444,11 @@
       document.getElementById('counterBox').style.display = 'flex';
       document.getElementById('historyToggle').style.display = 'block';
       elStatus.textContent = 'Démarrage de la caméra…';
+
+      // Préchargement de la liste des invités pendant que la caméra
+      // s'initialise : le premier scan sera aussi rapide que les suivants.
+      chargerIndex().catch(function () { /* sera retenté au premier scan */ });
+
       html5Qr = new Html5Qrcode('reader', { verbose: false });
       html5Qr.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 240, height: 240 }, aspectRatio: 1.0 },
         function (txt) { onDecoded(txt); }, function () {}
